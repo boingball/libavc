@@ -1117,6 +1117,20 @@ typedef struct _DecStruct
     UWORD16 u2_mv_2mb[2];
     UWORD32 u4_skip_frm_mask;
 
+    /*
+     * Legacy application frame-skip bookkeeping.
+     *
+     * Upstream removed the public B/PB skip API but left the slice-level
+     * skip implementation and u4_skip_frm_mask in this decoder revision.
+     * MintVID restores the old API-side picture/NAL boundary state so a
+     * skipped non-reference picture cannot leak into the following decode
+     * call or make libavc treat the next picture as part of the skipped one.
+     */
+    WORD32  i4_app_skip_mode;
+    WORD32  i4_dec_skip_mode;
+    UWORD32 u4_prev_nal_skipped;
+    UWORD32 u4_return_to_app;
+
     /* variable for finding the no.of mbs decoded in the current picture */
     UWORD32 u4_total_mbs_coded;
     /* member added for supporting fragmented annex - B */

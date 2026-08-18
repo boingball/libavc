@@ -1222,6 +1222,10 @@ void ih264d_init_decoder(void * ps_dec_params)
     ps_dec->u4_app_disable_deblk_frm = 0;
     ps_dec->i4_degrade_type = 0;
     ps_dec->i4_degrade_pics = 0;
+    ps_dec->i4_app_skip_mode = IVD_SKIP_NONE;
+    ps_dec->i4_dec_skip_mode = IVD_SKIP_NONE;
+    ps_dec->u4_prev_nal_skipped = 0;
+    ps_dec->u4_return_to_app = 0;
 
     memset(ps_dec->ps_pps, 0,
            ((sizeof(dec_pic_params_t)) * MAX_NUM_PIC_PARAMS));
@@ -2490,6 +2494,12 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
         ih264d_init_decoder(ps_dec);
     }
 
+    /*
+     * The legacy skip path uses this flag only to bridge NALs which belong
+     * to the same application decode call. Never carry it into the next AU.
+     */
+    ps_dec->u4_prev_nal_skipped = 0;
+
     ps_dec->u4_cur_mb_addr = 0;
     ps_dec->u4_total_mbs_coded = 0;
     ps_dec->u2_cur_slice_num = 0;
@@ -2563,6 +2573,43 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
         bytes_consumed = buflen + u4_length_of_start_code;
         ps_dec_op->u4_num_bytes_consumed += bytes_consumed;
 
+        /*
+         * Restore the legacy SKIP_B API boundary handling, adapted for the
+         * current decoder.  Skip only non-reference VCL slices here; SEI/AUD
+         * and other non-VCL NALs must not be mistaken for a skipped picture.
+         *
+         * A non-reference P picture is also safe to discard from the
+         * reference-chain point of view.  That makes Turbo slightly more
+         * aggressive on encoders which emit non-reference P pictures, but
+         * avoids the old implementation's ambiguity without parsing the
+         * entire slice twice.
+         */
+        if(buflen && ps_dec->i4_app_skip_mode == IVD_SKIP_B)
+        {
+            UWORD8 u1_firstbyte = *(pu1_buf + u4_length_of_start_code);
+            UWORD8 u1_nal_type = (UWORD8)NAL_UNIT_TYPE(u1_firstbyte);
+            UWORD8 u1_nal_ref_idc = (UWORD8)NAL_REF_IDC(u1_firstbyte);
+
+            if((u1_nal_type == SLICE_NAL) && (u1_nal_ref_idc == 0))
+            {
+                cur_slice_is_nonref = 1;
+                continue;
+            }
+
+            if(cur_slice_is_nonref &&
+               (u1_nal_type == SLICE_NAL || u1_nal_type == IDR_SLICE_NAL))
+            {
+                ps_dec_op->u4_num_bytes_consumed -= bytes_consumed;
+                ps_dec_op->e_pic_type = IV_B_FRAME;
+                ps_dec_op->u4_error_code = IVD_DEC_FRM_SKIPPED;
+                ps_dec_op->u4_frame_decoded_flag = 0;
+                ih264d_signal_decode_thread(ps_dec);
+                if(ps_dec->u4_num_cores == 3)
+                    ih264d_signal_bs_deblk_thread(ps_dec);
+                return IV_FAIL;
+            }
+        }
+
         if(buflen)
         {
             memcpy(pu1_bitstrm_buf, pu1_buf + u4_length_of_start_code,
@@ -2613,6 +2660,12 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
 
         }
 
+        /*
+         * PB-skip may consume one or more non-reference NALs while looking
+         * for the next safe picture boundary.  parse_slice sets
+         * u4_return_to_app when that boundary is reached.
+         */
+        ps_dec->u4_return_to_app = 0;
         ret = ih264d_parse_nal_unit(dec_hdl, ps_dec_op,
                               pu1_bitstrm_buf, buflen);
         if(ret != OK)
@@ -2647,6 +2700,24 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
                 break;
             }
 
+        }
+
+        if(ps_dec->u4_return_to_app)
+        {
+            /*
+             * The current NAL belongs to the next picture. Put it back and
+             * return a clean "frame skipped" result to the caller. This is
+             * the bookkeeping which disappeared when upstream removed the
+             * public frame-skip API, and is what the direct mask hack lacked.
+             */
+            ps_dec_op->u4_num_bytes_consumed -= bytes_consumed;
+            ps_dec_op->u4_error_code = IVD_DEC_FRM_SKIPPED;
+            ps_dec_op->u4_frame_decoded_flag = 0;
+
+            ih264d_signal_decode_thread(ps_dec);
+            if(ps_dec->u4_num_cores == 3)
+                ih264d_signal_bs_deblk_thread(ps_dec);
+            return IV_FAIL;
         }
 
         header_data_left = ((ps_dec->i4_decode_header == 1)
@@ -2781,6 +2852,24 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
     {
         ps_dec_op->u4_error_code |= (1 << IVD_INSUFFICIENTDATA);
         api_ret_value = IV_FAIL;
+    }
+
+    /*
+     * The input buffer can end immediately after the picture we chose to
+     * skip.  Report that as an intentional skip before the generic
+     * incomplete-picture/end-of-picture machinery gets a chance to conceal
+     * or display it.
+     */
+    if(ps_dec->u4_prev_nal_skipped || cur_slice_is_nonref)
+    {
+        ps_dec_op->e_pic_type =
+            ps_dec->i4_app_skip_mode == IVD_SKIP_B ? IV_B_FRAME : IV_NA_FRAME;
+        ps_dec_op->u4_error_code = IVD_DEC_FRM_SKIPPED;
+        ps_dec_op->u4_frame_decoded_flag = 0;
+        ih264d_signal_decode_thread(ps_dec);
+        if(ps_dec->u4_num_cores == 3)
+            ih264d_signal_bs_deblk_thread(ps_dec);
+        return IV_FAIL;
     }
 
     if((ps_dec->u4_pic_buf_got == 1)
@@ -3518,11 +3607,29 @@ WORD32 ih264d_set_params(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
     ps_dec = (dec_struct_t *)(dec_hdl->pv_codec_handle);
 
     ps_dec->u4_skip_frm_mask = 0;
+    ps_dec->i4_app_skip_mode = ps_ctl_ip->e_frm_skip_mode;
+    ps_dec->i4_dec_skip_mode = IVD_SKIP_NONE;
+    ps_dec->u4_prev_nal_skipped = 0;
+    ps_dec->u4_return_to_app = 0;
 
     ps_ctl_op->u4_error_code = 0;
 
-    if(ps_ctl_ip->e_frm_skip_mode != IVD_SKIP_NONE)
+    /*
+     * Restore the two legacy modes MintVID uses.  Keep every other public
+     * skip request rejected rather than pretending unsupported combinations
+     * are safe in this newer libavc revision.
+     */
+    if(ps_ctl_ip->e_frm_skip_mode == IVD_SKIP_B)
     {
+        ps_dec->u4_skip_frm_mask = B_SLC_BIT;
+    }
+    else if(ps_ctl_ip->e_frm_skip_mode == IVD_SKIP_PB)
+    {
+        ps_dec->u4_skip_frm_mask = P_SLC_BIT | B_SLC_BIT;
+    }
+    else if(ps_ctl_ip->e_frm_skip_mode != IVD_SKIP_NONE)
+    {
+        ps_dec->i4_app_skip_mode = IVD_SKIP_NONE;
         ps_ctl_op->u4_error_code = (1 << IVD_UNSUPPORTEDPARAM);
         ret = IV_FAIL;
     }
@@ -3611,6 +3718,10 @@ WORD32 ih264d_set_default_params(iv_obj_t *dec_hdl,
     {
         ps_dec->u4_app_disp_width = 0;
         ps_dec->u4_skip_frm_mask = 0;
+        ps_dec->i4_app_skip_mode = IVD_SKIP_NONE;
+        ps_dec->i4_dec_skip_mode = IVD_SKIP_NONE;
+        ps_dec->u4_prev_nal_skipped = 0;
+        ps_dec->u4_return_to_app = 0;
         ps_dec->i4_decode_header = 1;
 
         ps_ctl_op->u4_error_code = 0;
