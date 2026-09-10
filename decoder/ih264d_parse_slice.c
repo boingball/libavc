@@ -1891,13 +1891,18 @@ WORD32 ih264d_parse_decode_slice(UWORD8 u1_is_idr_slice,
 
         /* Combined MOD+DIV of the same dividend - see ih264_m68k_divmod.h
          * for why 68060 needs the explicit helper here. Runs once per
-         * slice. */
+         * slice. Signed variant: `u2_first_mb_in_slice - 1` promotes to a
+         * signed int and is -1 (not a huge unsigned value) whenever the
+         * slice starts at macroblock 0 - the common case, the first slice
+         * of essentially every picture - matching what the original
+         * MOD()/DIV() macros computed on this same signed expression. */
         {
-            UWORD32 u4_mbx_tmp;
-            ps_dec->u2_mby = (UWORD16)mr_ih264_divmod_u32(
-                            u2_first_mb_in_slice - 1, ps_seq->u2_frm_wd_in_mbs,
-                            &u4_mbx_tmp);
-            ps_dec->u2_mbx = (UWORD16)u4_mbx_tmp;
+            WORD32 i4_mbx_tmp;
+            ps_dec->u2_mby = (UWORD16)mr_ih264_divmod_s32(
+                            (WORD32)u2_first_mb_in_slice - 1,
+                            (WORD32)ps_seq->u2_frm_wd_in_mbs,
+                            &i4_mbx_tmp);
+            ps_dec->u2_mbx = (UWORD16)i4_mbx_tmp;
         }
         ps_dec->u2_mby <<= ps_cur_slice->u1_mbaff_frame_flag;
         ps_dec->i2_prev_slice_mbx = ps_dec->u2_mbx;
