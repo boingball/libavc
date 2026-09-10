@@ -53,6 +53,7 @@
 #include "ih264d_parse_slice.h"
 #include "ih264d_mvpred.h"
 #include "ih264d_mb_utils.h"
+#include "ih264_m68k_divmod.h"
 
 #include "ih264d_defs.h"
 #include "ih264d_quant_scaling.h"
@@ -627,8 +628,17 @@ WORD32 ih264d_start_of_pic(dec_struct_t *ps_dec,
 
         UWORD8 u1_mbaff = ps_cur_slice->u1_mbaff_frame_flag;
 
-        UWORD16 uc_lastmbs = (((ps_dec->u2_pic_wd) >> 4)
-                        % (ps_dec->u4_recon_mb_grp >> u1_mbaff));
+        /* Only the remainder is used (quotient discarded) - see
+         * ih264_m68k_divmod.h for why that still needs the m68k-safe
+         * helper on 68060: GCC's m68k backend has no "remainder only"
+         * lowering, so this compiles to the same forbidden combined
+         * divide as a genuine div+mod pair. Runs once per picture. */
+        UWORD32 u4_lastmbs_rem;
+        UWORD16 uc_lastmbs;
+        (void)mr_ih264_divmod_u32((ps_dec->u2_pic_wd) >> 4,
+                                  ps_dec->u4_recon_mb_grp >> u1_mbaff,
+                                  &u4_lastmbs_rem);
+        uc_lastmbs = (UWORD16)u4_lastmbs_rem;
         UWORD16 ui16_lastmbs_widthY =
                         (uc_lastmbs ? (uc_lastmbs << 4) : ((ps_dec->u4_recon_mb_grp
                                         >> u1_mbaff) << 4));
@@ -1780,6 +1790,7 @@ WORD32 ih264d_parse_decode_slice(UWORD8 u1_is_idr_slice,
                 UWORD32 x_offset;
                 UWORD32 y_offset;
                 UWORD32 u4_frame_stride;
+                UWORD32 u4_mb_x_tmp;
                 tfr_ctxt_t *ps_trns_addr; // = &ps_dec->s_tran_addrecon_parse;
 
                 if(ps_dec->u1_separate_parse)
@@ -1790,8 +1801,13 @@ WORD32 ih264d_parse_decode_slice(UWORD8 u1_is_idr_slice,
                 {
                     ps_trns_addr = &ps_dec->s_tran_addrecon;
                 }
-                u2_mb_x = MOD(u2_first_mb_in_slice, u2_frm_wd_in_mbs);
-                u2_mb_y = DIV(u2_first_mb_in_slice, u2_frm_wd_in_mbs);
+                /* Combined MOD+DIV of the same dividend - see
+                 * ih264_m68k_divmod.h for why 68060 needs the explicit
+                 * helper here. Runs once per slice. */
+                u2_mb_y = (UWORD16)mr_ih264_divmod_u32(u2_first_mb_in_slice,
+                                                       u2_frm_wd_in_mbs,
+                                                       &u4_mb_x_tmp);
+                u2_mb_x = (UWORD16)u4_mb_x_tmp;
 
                 u2_mb_y <<= u1_mb_aff;
 
@@ -1873,10 +1889,16 @@ WORD32 ih264d_parse_decode_slice(UWORD8 u1_is_idr_slice,
 
         ps_dec->ps_part = ps_dec->ps_parse_part_params;
 
-        ps_dec->u2_mbx =
-                        (MOD(u2_first_mb_in_slice - 1, ps_seq->u2_frm_wd_in_mbs));
-        ps_dec->u2_mby =
-                        (DIV(u2_first_mb_in_slice - 1, ps_seq->u2_frm_wd_in_mbs));
+        /* Combined MOD+DIV of the same dividend - see ih264_m68k_divmod.h
+         * for why 68060 needs the explicit helper here. Runs once per
+         * slice. */
+        {
+            UWORD32 u4_mbx_tmp;
+            ps_dec->u2_mby = (UWORD16)mr_ih264_divmod_u32(
+                            u2_first_mb_in_slice - 1, ps_seq->u2_frm_wd_in_mbs,
+                            &u4_mbx_tmp);
+            ps_dec->u2_mbx = (UWORD16)u4_mbx_tmp;
+        }
         ps_dec->u2_mby <<= ps_cur_slice->u1_mbaff_frame_flag;
         ps_dec->i2_prev_slice_mbx = ps_dec->u2_mbx;
         ps_dec->i2_prev_slice_mby = ps_dec->u2_mby;

@@ -52,6 +52,7 @@
 #include "ih264d_tables.h"
 #include "ih264d_format_conv.h"
 #include "ih264d_defs.h"
+#include "ih264_m68k_divmod.h"
 UWORD16 ih264d_update_csbp_8x8(UWORD16 u2_luma_csbp);
 void ih264d_fill_bs2_horz_vert(UWORD32 *pu4_bs, /* Base pointer of BS table */
                                WORD32 u4_left_mb_csbp, /* csbp of left mb */
@@ -457,8 +458,14 @@ void ih264d_recon_deblk_slice(dec_struct_t *ps_dec, tfr_ctxt_t *ps_tfr_cxt)
                                ps_dec->u2_frm_wd_in_mbs, 0);
 
 
-    i16_mb_x = MOD(u2_first_mb_in_slice, i2_pic_wdin_mbs);
-    i16_mb_y = DIV(u2_first_mb_in_slice, i2_pic_wdin_mbs);
+    /* Combined MOD+DIV of the same dividend - see ih264_m68k_divmod.h for
+     * why 68060 needs the explicit helper here. Runs once per slice. */
+    {
+        UWORD32 u4_mb_x_tmp;
+        i16_mb_y = (UWORD16)mr_ih264_divmod_u32(u2_first_mb_in_slice,
+                                                i2_pic_wdin_mbs, &u4_mb_x_tmp);
+        i16_mb_x = (UWORD16)u4_mb_x_tmp;
+    }
     i16_mb_y <<= u1_mbaff;
     ps_dec->i2_recon_thread_mb_y = i16_mb_y;
     u4_frame_stride = ps_dec->u2_frm_wd_y

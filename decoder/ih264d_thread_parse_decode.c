@@ -50,6 +50,7 @@
 #include "ih264d_process_intra_mb.h"
 #include "ih264d_deblocking.h"
 #include "ih264d_format_conv.h"
+#include "ih264_m68k_divmod.h"
 
 void ih264d_deblock_mb_level(dec_struct_t *ps_dec,
                              dec_mb_info_t *ps_cur_mb_info,
@@ -496,8 +497,14 @@ WORD32 ih264d_decode_slice_thread(dec_struct_t *ps_dec)
 
     u2_first_mb_in_slice = ps_dec->ps_decode_cur_slice->u4_first_mb_in_slice;
 
-    i16_mb_x = MOD(u2_first_mb_in_slice, i2_pic_wdin_mbs);
-    i16_mb_y = DIV(u2_first_mb_in_slice, i2_pic_wdin_mbs);
+    /* Combined MOD+DIV of the same dividend - see ih264_m68k_divmod.h for
+     * why 68060 needs the explicit helper here. Runs once per slice. */
+    {
+        UWORD32 u4_mb_x_tmp;
+        i16_mb_y = (UWORD16)mr_ih264_divmod_u32(u2_first_mb_in_slice,
+                                                i2_pic_wdin_mbs, &u4_mb_x_tmp);
+        i16_mb_x = (UWORD16)u4_mb_x_tmp;
+    }
     i16_mb_y <<= u4_mbaff;
     ps_dec->i2_dec_thread_mb_y = i16_mb_y;
 
